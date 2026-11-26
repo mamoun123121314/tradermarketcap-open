@@ -451,69 +451,6 @@ test('pyth: a treasury wallet that has moved fails the read rather than guessing
   } finally { restore(); }
 });
 
-// Fake Pump.fun API + Solana RPC. Shapes captured from the live endpoints on 2026-11-26:
-// the mint has 6 decimals, the chain reports the post-burn supply, and Pump.fun's own
-// indexed token record reports circulating in base units.
-const PUMP_MINT = 'pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn';
-const PUMP_RULE = { method: 'pump', mint: PUMP_MINT, max: 1000000000000 };
-function fakePump({ record = {}, rpc = {} } = {}) {
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = async (url, opts = {}) => {
-    const u = String(url);
-    if (u.includes('frontend-api-v3.pump.fun')) {
-      const body = { mint: PUMP_MINT, verified: true, base_decimals: 6, circulating_supply_str: '399462335624000000', ...record };
-      return { ok: true, status: 200, json: async () => body };
-    }
-    assert.ok(u.includes('solana'), 'only the Pump.fun API and Solana RPC are called');
-    const req = JSON.parse(opts.body);
-    assert.equal(req.method, 'getTokenSupply');
-    assert.deepEqual(req.params, [PUMP_MINT]);
-    const value = { amount: '820375385290371930', decimals: 6, uiAmountString: '820375385290.37193', ...rpc };
-    return { ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: req.id, result: { value } }) };
-  };
-  return () => { globalThis.fetch = realFetch; };
-}
-
-test('pump: total is the live Solana supply and circulating is Pump.fun\'s published figure', async () => {
-  const restore = fakePump();
-  try {
-    const s = await readSupply(PUMP_RULE);
-    assert.equal(s.total, 820375385290.37193);
-    assert.equal(s.circulating, 399462335624);
-    assert.equal(s.max, 1000000000000);
-    assert.equal(s.parts[0].src, `https://solscan.io/token/${PUMP_MINT}`);
-    assert.equal(s.excluded.length, 1);
-    assert.ok(Math.abs(s.excluded[0].amount - (820375385290.37193 - 399462335624)) < 1e-6);
-    assert.equal(s.excluded[0].src, 'https://pump.fun/pump-token');
-    assert.equal(s.checked, true);
-    assert.equal(s.method, 'pump');
-  } finally { restore(); }
-});
-
-test('pump: a bad Pump.fun record or circulating above the chain total fails the read', async () => {
-  for (const record of [
-    { mint: 'some-other-mint' },
-    { verified: false },
-    { base_decimals: 9 },
-    { circulating_supply_str: 'NaN' },
-    { circulating_supply_str: '123' },
-    { circulating_supply_str: '900000000000000000' },
-  ]) {
-    const restore = fakePump({ record });
-    try { await assert.rejects(readSupply(PUMP_RULE)); } finally { restore(); }
-  }
-  const restore = fakePump({ rpc: { uiAmountString: 'NaN' } });
-  try { await assert.rejects(readSupply(PUMP_RULE), /pump: bad supply/); } finally { restore(); }
-});
-
-test('pump: the seed rule attaches to the pump-fun coin id served by the site', () => {
-  const { 'pump-fun': pump } = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8'));
-  assert.equal(pump.symbol, 'PUMP');
-  assert.equal(pump.supply.method, 'pump');
-  assert.equal(pump.supply.mint, PUMP_MINT);
-  assert.equal(pump.supply.max, 1000000000000);
-});
-
 // QNT: totalSupply() on 0x4a22...4675 is a pre-burn artefact (it reads 45,467,000 forever because the
 // 2018 burn parked the unsold tokens at the contract address instead of decrementing the counter).
 // Real values read on Ethereum mainnet, 2026-11-22:
@@ -1427,4 +1364,52 @@ test('VVV: API errors and NaN fail the read', async () => {
   }
   fakeVenice({ burn: {} });
   await assert.rejects(readSupply({ method: 'venice' }), /totalBurned is not an amount/);
+});
+
+// Pump.fun: the official mint is fixed, but team/investor/ecosystem/foundation wallets are not
+// published, so the rule publishes the live chain total and withholds circulating.
+const PUMP_MINT = 'pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn';
+
+test('pump-fun: seed rule reads the Solana mint total and withholds circulating', async () => {
+  const coins = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8'));
+  const pump = coins['pump-fun'];
+  assert.equal(pump.symbol, 'PUMP');
+  assert.equal(pump.name, 'Pump.fun');
+  assert.equal(pump.supply.method, 'tokens');
+  assert.equal(pump.supply.circulating, false);
+  assert.equal(pump.supply.max, 1000000000000);
+  assert.equal(pump.supply.parts.length, 1);
+  assert.equal(pump.supply.parts[0].chain, 'sol');
+  assert.equal(pump.supply.parts[0].address, PUMP_MINT);
+
+  const restore = fakeSol({ total: '820375385290371930', holders: {} });
+  try {
+    const s = await readSupply(pump.supply);
+    assert.equal(s.circulating, null, 'circulating is withheld, never overstated');
+    assert.ok(Math.abs(s.total - 820375385290.37193) < 0.01);
+    assert.equal(s.max, 1000000000000);
+    assert.equal(s.parts.length, 1);
+    assert.equal(s.parts[0].src, `https://solscan.io/token/${PUMP_MINT}`);
+    assert.equal(s.excluded.length, 0, 'no guessed lock wallets are listed');
+    assert.match(s.note, /Circulating is withheld/);
+    assert.equal(s.checked, true);
+    assert.equal(s.method, 'tokens');
+  } finally { restore(); }
+});
+
+test('pump-fun: Solana RPC errors and NaN fail the read instead of guessing a supply', async () => {
+  globalThis.fetch = async () => ({ ok: false, status: 500, json: async () => ({ error: 'rpc fail' }) });
+  await assert.rejects(readSupply({
+    method: 'tokens',
+    parts: [{ chain: 'sol', address: PUMP_MINT }],
+    circulating: false,
+  }), /500/);
+  const restore = fakeSol({ total: 'NaN' });
+  try {
+    await assert.rejects(readSupply({
+      method: 'tokens',
+      parts: [{ chain: 'sol', address: PUMP_MINT }],
+      circulating: false,
+    }));
+  } finally { restore(); }
 });

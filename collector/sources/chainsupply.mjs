@@ -9,12 +9,6 @@ import { extraSupply } from './extra.mjs';
 
 const BURN = '0x000000000000000000000000000000000000dEaD';
 const LINK_TOKEN = '0x514910771AF9Ca656af840dff83E8264EcF986CA'; // Chainlink ERC-20 on Ethereum
-// PUMP (Pump.fun). The official mint is named in pump.fun/docs/custom-pairs and in Pump.fun's
-// launch announcement. Pump.fun's own coins-v3 API is the feed behind its public pump-token page;
-// it publishes the circulating figure. The live Solana mint supply is the total still in existence
-// after buyback burns. Pump.fun does not publish the wallets behind its team, investor and community
-// allocations, so the non-circulating gap is shown as one sourced exclusion, not guessed addresses.
-const PUMP_API = 'https://frontend-api-v3.pump.fun/coins-v3/';
 
 // BNB on BNB Smart Chain (BSC). BSC mints no new BNB: validators earn fees only. Every BNB that existed when BSC
 // launched was put in the TokenHub system contract at genesis (176,405,560.9 BNB, plus 1,000 BNB for two bootstrap
@@ -379,6 +373,8 @@ const METHODS = {
       total += t;
       parts.push({ chain: p.chain, amount: t, src: tokenLink(p) });
     }
+    // Never publish a number derived from a failed or malformed chain read.
+    if (!Number.isFinite(total) || !(total > 0)) throw new Error('tokens: bad total supply');
     const excluded = [];
     const ex = [...(r.exclude || []), ...r.parts.filter(p => EXPLORER[p.chain] && !r.noBurn).map(p => ({ chain: p.chain, token: p.address, holder: BURN, reason: 'Burn address' }))];
     for (const e of ex) {
@@ -632,31 +628,6 @@ const METHODS = {
     return { circulating: circ, total, src: url,
       excluded: [{ reason: 'Locked team/community allocations and Jupiter Lock vesting escrows', amount: total - circ, src: 'https://discuss.jup.ag/t/jup-community-audit-feb-2025/34764' }],
       note: 'Jupiter Token API circSupply: locked team/community wallets and unvested Jupiter Lock escrows excluded by Jupiter' };
-  },
-  // Pump.fun publishes PUMP circulating supply in the same indexed token record its own
-  // pump-token page reads. Total is the live Solana mint supply, so buyback burns are already
-  // out of it. Pump.fun does not publish the wallets behind the team, investor, ecosystem and
-  // foundation allocations, so the gap is listed as one sourced exclusion rather than guessed.
-  async pump(r) {
-    const mint = r?.mint;
-    if (!mint || typeof mint !== 'string') throw new Error('pump: rule needs a mint');
-    const api = `${PUMP_API}${mint}`;
-    const [total, d] = await Promise.all([
-      tokenTotal({ chain: 'sol', address: mint }),
-      getJSON(api),
-    ]);
-    if (d?.mint !== mint || d.verified !== true || Number(d.base_decimals) !== 6) throw new Error('pump: bad token record');
-    if (typeof d.circulating_supply_str !== 'string' || !/^\d+$/.test(d.circulating_supply_str)) throw new Error('pump: no circulating supply');
-    const raw = BigInt(d.circulating_supply_str);
-    if (raw % 1000000n !== 0n) throw new Error('pump: circulating supply is not whole PUMP');
-    const circ = Number(raw / 1000000n);
-    if (!Number.isFinite(total) || !(total > 0) || !(Number.isSafeInteger(circ) && circ > 0) || circ > total) throw new Error('pump: bad supply');
-    const gap = total - circ;
-    const link = tokenLink({ chain: 'sol', address: mint });
-    return { circulating: circ, total, src: link,
-      parts: [{ chain: 'sol', amount: total, src: link }],
-      excluded: gap > 0 ? [{ reason: 'Non-circulating PUMP: team, investor, ecosystem and foundation allocations excluded from Pump.fun\'s own circulating figure; Pump.fun does not publish the individual wallet addresses', amount: gap, src: 'https://pump.fun/pump-token' }] : [],
-      note: `Total is the live Solana mint supply of ${mint}; Pump.fun's buyback burns are already removed. Circulating is Pump.fun's own published figure from ${api}, the feed behind https://pump.fun/pump-token. Locked team, investor and community allocations are not published as addresses, so the gap is listed with Pump.fun as its source instead of being assigned to guessed wallets.` };
   },
   // Quant (QNT): the contract's totalSupply() is NOT the live supply and must not be published as one.
   // The counter was seeded with the 45,467,000 planned cap in 2018 and never decremented: the September 2018
